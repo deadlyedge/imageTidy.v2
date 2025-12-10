@@ -32,6 +32,14 @@ from openai import OpenAI
 
 load_dotenv()
 
+DEFAULT_CATEGORIES = {
+    "cad": [".dwg", ".dxf", ".cad"],
+    "photos": [".jpg", ".jpeg", ".png", ".tif", ".bmp"],
+    "docs": [".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf"],
+    "other": [],
+}
+TARGET_PATTERN = "<time-range>-<project-name>/<category>"
+
 
 def setup_logging(log_path: Path) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,7 +60,10 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def call_ai_for_config(
-    folder_summary: dict[str, Any], temperature: float, max_tokens: int
+    tag_list: list[dict[str, Any]],
+    overview: dict[str, Any],
+    temperature: float,
+    max_tokens: int,
 ) -> dict[str, Any]:
     api_key = os.getenv("OPENROUTER_API_KEY")
     openai_client = OpenAI(
@@ -63,8 +74,10 @@ def call_ai_for_config(
         raise SystemExit("OPENROUTER_API_KEY must be set to contact the configured LLM")
 
     payload = settings.AI_PROMPT.strip()
-    payload += "\n\nFolder structure summary (JSON):\n"
-    payload += json.dumps(folder_summary, ensure_ascii=False, indent=2)
+    payload += "\n\nFolder overview (JSON):\n"
+    payload += json.dumps(overview, ensure_ascii=False, indent=2)
+    payload += "\n\nTag list (JSON):\n"
+    payload += json.dumps(tag_list, ensure_ascii=False, indent=2)
 
     response = openai_client.chat.completions.create(
         model=settings.MODEL_NAME,
@@ -244,6 +257,24 @@ def main() -> None:
         help="Folder tree summary previously generated.",
     )
     parser.add_argument(
+        "--tag-summary",
+        type=Path,
+        default=Path("output/tag_summary.json"),
+        help="Deduplicated folder tags for record keeping.",
+    )
+    parser.add_argument(
+        "--tag-input",
+        type=Path,
+        default=Path("output/tag_input.json"),
+        help="Tag list (just keywords) that is fed to the AI.",
+    )
+    parser.add_argument(
+        "--overview",
+        type=Path,
+        default=Path("output/folder_overview.json"),
+        help="Folder overview used to explain folder weights to the AI.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("output"),
@@ -281,11 +312,11 @@ def main() -> None:
     parser.add_argument(
         "--ai-temperature",
         type=float,
-        default=0.0,
+        default=0.1,
         help="Temperature for the LLM call.",
     )
     parser.add_argument(
-        "--ai-max-tokens", type=int, default=1500, help="Max tokens for the LLM call."
+        "--ai-max-tokens", type=int, default=3000, help="Max tokens for the LLM call."
     )
     args = parser.parse_args()
 
@@ -305,15 +336,35 @@ def main() -> None:
     if not args.folder_summary.exists():
         raise SystemExit(f"Folder summary missing: {args.folder_summary}")
     folder_summary = json.loads(args.folder_summary.read_text(encoding="utf-8"))
+    if not args.tag_summary.exists():
+        raise SystemExit(f"Tag summary missing: {args.tag_summary}")
+    tag_summary = json.loads(args.tag_summary.read_text(encoding="utf-8"))
+    if not args.tag_input.exists():
+        raise SystemExit(f"Tag input missing: {args.tag_input}")
+    tag_input = json.loads(args.tag_input.read_text(encoding="utf-8"))
+    if not args.overview.exists():
+        raise SystemExit(f"Folder overview missing: {args.overview}")
+    overview = json.loads(args.overview.read_text(encoding="utf-8"))
 
     if args.manual_config:
         config = load_json(args.manual_config)
     elif args.no_ai:
         raise SystemExit("Either provide --manual-config or allow AI lookup")
     else:
-        config = call_ai_for_config(
-            folder_summary, args.ai_temperature, args.ai_max_tokens
+        raw_config = call_ai_for_config(
+            tag_input.get("tags", []),
+            overview,
+            args.ai_temperature,
+            args.ai_max_tokens,
         )
+        project_entries = raw_config.get("projects")
+        if not isinstance(project_entries, list) or not project_entries:
+            raise SystemExit("AI output must include a non-empty 'projects' array")
+        config = {
+            "projects": project_entries,
+            "categories": DEFAULT_CATEGORIES,
+            "target_pattern": TARGET_PATTERN,
+        }
 
     projects = build_projects(config["projects"])
     project_dates = derive_project_date_map(metadata, projects)
@@ -354,6 +405,10 @@ def main() -> None:
             "generated_at": datetime.now(UTC).isoformat(),
             "metadata_count": len(metadata),
             "folder_summary": str(args.folder_summary),
+            "tag_summary": str(args.tag_summary),
+            "tag_input": str(args.tag_input),
+            "overview": overview,
+            "overview_path": str(args.overview),
             "derived_time_ranges": {
                 canonical: [tr.label for tr in ranges]
                 for canonical, ranges in project_time_ranges.items()

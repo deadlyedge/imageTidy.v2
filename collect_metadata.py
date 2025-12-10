@@ -7,7 +7,7 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, date
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Any
 
 import settings
 
@@ -57,7 +57,7 @@ def update_date_stats(stats: dict, current: date) -> None:
         stats["max_date"] = current
 
 
-def build_folder_summary(metadata: list[dict], root_name: str) -> dict[str, object]:
+def build_folder_summary(metadata: list[dict], root_name: str) -> dict[str, Any]:
     folder_stats: dict[str, dict] = {}
     child_map: dict[str, set[str]] = defaultdict(set)
 
@@ -107,6 +107,55 @@ def build_folder_summary(metadata: list[dict], root_name: str) -> dict[str, obje
     }
 
 
+def build_overview(metadata: list[dict], folder_summary: dict[str, Any]) -> dict[str, Any]:
+    dates = [datetime.fromisoformat(entry["modified_time"]).date() for entry in metadata]
+    earliest = min(dates).isoformat() if dates else None
+    latest = max(dates).isoformat() if dates else None
+    folders = folder_summary.get("folders", [])
+    tree = build_tree_string(folder_summary, folder_summary.get("root", "root"))
+    return {
+        "total_files": len(metadata),
+        "folder_count": len(folders),
+        "earliest_modified": earliest,
+        "latest_modified": latest,
+        "tree": tree,
+    }
+
+
+def build_tree_string(folder_summary: dict[str, Any], root_name: str) -> str:
+    nodes = {node["folder_chain"]: node for node in folder_summary.get("folders", [])}
+
+    def ensure_node(chain: str) -> dict[str, Any]:
+        return nodes.setdefault(
+            chain,
+            {
+                "folder_chain": chain,
+                "folder_name": chain.split(" / ")[-1] if chain else root_name,
+                "file_count": 0,
+                "children": [],
+            },
+        )
+
+    def render(chain: str, indent: str, last: bool) -> list[str]:
+        node = ensure_node(chain)
+        connector = "└── " if last else "├── "
+        prefix = indent + (connector if indent else "")
+        line = f"{prefix}{node.get('folder_name') or root_name} [{node.get('file_count', 0)}]"
+        lines = [line]
+        children = node.get("children", [])
+        for idx, child in enumerate(children):
+            next_indent = indent + ("    " if last else "│   ")
+            lines.extend(render(child, next_indent, idx == len(children) - 1))
+        return lines
+
+    root_chain = root_name
+    root_node = ensure_node(root_chain)
+    lines = [f"{root_node.get('folder_name') or root_name} [{root_node.get('file_count', 0)}]"]
+    for idx, child in enumerate(root_node.get("children", [])):
+        lines.extend(render(child, "", idx == len(root_node.get("children", [])) - 1))
+    return "\n".join(lines)
+
+
 def collect(source: Path) -> list[dict]:
     results: list[dict] = []
     for path in source.rglob("*"):
@@ -131,6 +180,34 @@ def collect(source: Path) -> list[dict]:
         )
     results.sort(key=lambda entry: entry["full_path"])
     return results
+
+
+def normalize_tag(segment: str) -> str | None:
+    trimmed = segment.strip()
+    if not trimmed:
+        return None
+    if trimmed.isdigit():
+        return None
+    return trimmed
+
+
+def build_tag_summary(folder_summary: dict[str, Any]) -> dict[str, Any]:
+    tags: set[str] = set()
+    mapping: dict[str, set[str]] = defaultdict(set)
+    for node in folder_summary.get("folders", []):
+        if node.get("file_count", 0) <= 0:
+            continue
+        chain = node.get("folder_chain", "")
+        segments = [segment.strip() for segment in chain.split(" / ") if segment.strip()]
+        for segment in segments:
+            normalized = normalize_tag(segment)
+            if normalized:
+                tags.add(normalized)
+                mapping[normalized].add(chain)
+    return {
+        "tags": sorted(tags),
+        "mapping": {tag: sorted(chains) for tag, chains in mapping.items()},
+    }
 
 
 def main() -> None:
@@ -160,10 +237,27 @@ def main() -> None:
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     summary = build_folder_summary(metadata, source_folder.name)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    tag_summary = build_tag_summary(summary)
+    tags_path = output_dir / "tag_summary.json"
+    tags_path.write_text(
+        json.dumps(tag_summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tag_input_path = output_dir / "tag_input.json"
+    tag_input_path.write_text(
+        json.dumps({"tags": tag_summary.get("tags", [])}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    overview = build_overview(metadata, summary)
+    overview_path = output_dir / "folder_overview.json"
+    overview_path.write_text(json.dumps(overview, ensure_ascii=False, indent=2), encoding="utf-8")
 
     logging.info("Collected %d files", len(metadata))
     logging.info("Metadata written to %s", metadata_path)
     logging.info("Folder summary written to %s", summary_path)
+    logging.info("Tag summary written to %s", tags_path)
+    logging.info("Tag input written to %s", tag_input_path)
+    logging.info("Folder overview written to %s", overview_path)
 
 
 if __name__ == "__main__":
