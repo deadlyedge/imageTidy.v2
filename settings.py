@@ -1,5 +1,5 @@
 MODEL_NAME = "openai/gpt-4o-mini"
-SOURCE_FOLDER = "F://老爸文件整理//sample"
+SOURCE_FOLDER = "F://老爸文件整理"
 AI_PROMPT = """
 You are helping me organize a large legacy project folder of CAD drawings, photos and documents.
 
