@@ -5,25 +5,29 @@ import csv
 import json
 import logging
 import os
+import shutil
 from collections import Counter
-from datetime import datetime, UTC
+from datetime import datetime, UTC, date
 from pathlib import Path
 from typing import Any
+
 from dotenv import load_dotenv
 
 import settings
 from imagetidy.planning import (
     FALLBACK_PROJECT_NAME,
     FALLBACK_TIME_RANGE_LABEL,
+    ProjectDefinition,
+    TimeRange,
     build_categories,
     build_projects,
     categorize_extension,
+    derive_time_ranges,
     ensure_json,
     find_time_range,
     match_project,
     parse_date,
 )
-
 from openai import OpenAI
 
 load_dotenv()
@@ -48,7 +52,7 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def call_ai_for_config(
-    sample: list[dict[str, Any]], temperature: float, max_tokens: int
+    folder_summary: dict[str, Any], temperature: float, max_tokens: int
 ) -> dict[str, Any]:
     api_key = os.getenv("OPENROUTER_API_KEY")
     openai_client = OpenAI(
@@ -59,8 +63,8 @@ def call_ai_for_config(
         raise SystemExit("OPENROUTER_API_KEY must be set to contact the configured LLM")
 
     payload = settings.AI_PROMPT.strip()
-    payload += "\n\nSample data (JSON array):\n"
-    payload += json.dumps(sample, ensure_ascii=False, indent=2)
+    payload += "\n\nFolder structure summary (JSON):\n"
+    payload += json.dumps(folder_summary, ensure_ascii=False, indent=2)
 
     response = openai_client.chat.completions.create(
         model=settings.MODEL_NAME,
@@ -76,8 +80,40 @@ def call_ai_for_config(
     return ensure_json(content)
 
 
+def derive_project_date_map(
+    metadata: list[dict[str, Any]], projects: list["ProjectDefinition"]
+) -> dict[str, list[date]]:
+    date_map: dict[str, list[date]] = {
+        project.canonical_name: [] for project in projects
+    }
+    for record in metadata:
+        candidate = match_project(record.get("folder_chain", ""), projects)
+        record["_matched_project"] = candidate
+        parsed_date = record.get("_parsed_date")
+        if not parsed_date:
+            parsed_date = parse_date(record["modified_time"])
+            record["_parsed_date"] = parsed_date
+        if candidate:
+            date_map[candidate.canonical_name].append(parsed_date)
+    return date_map
+
+
+def derive_project_time_ranges(
+    project_dates: dict[str, list[date]],
+) -> dict[str, list[TimeRange]]:
+    ranges: dict[str, list[TimeRange]] = {}
+    for canonical, dates in project_dates.items():
+        if dates:
+            ranges[canonical] = derive_time_ranges(sorted(dates))
+        else:
+            ranges[canonical] = []
+    return ranges
+
+
 def derive_target_filename(folder_chain: str, original_name: str) -> str:
-    parts = [segment.strip() for segment in folder_chain.split(" / ") if segment.strip()]
+    parts = [
+        segment.strip() for segment in folder_chain.split(" / ") if segment.strip()
+    ]
     if not parts:
         return original_name
     return "-".join(parts + [original_name])
@@ -87,6 +123,7 @@ def build_plan_entries(
     metadata: list[dict[str, Any]],
     config: dict[str, Any],
     target_root: Path,
+    project_time_ranges: dict[str, list[TimeRange]],
 ) -> tuple[list[dict[str, str]], list[str]]:
     if (
         "projects" not in config
@@ -106,36 +143,25 @@ def build_plan_entries(
 
     for record in metadata:
         folder_chain = record.get("folder_chain", "")
-        candidate = match_project(folder_chain, projects)
+        candidate = record.get("_matched_project") or match_project(
+            folder_chain, projects
+        )
         canonical = candidate.canonical_name if candidate else FALLBACK_PROJECT_NAME
         if not candidate:
             warnings.append(f"Could not match project for {record['full_path']}")
-        modified_date = parse_date(record["modified_time"])
+        modified_date = record.get("_parsed_date")
+        if not modified_date:
+            modified_date = parse_date(record["modified_time"])
         assigned_range = FALLBACK_TIME_RANGE_LABEL
         if candidate:
-            time_range = find_time_range(modified_date, candidate)
+            overrides = project_time_ranges.get(canonical)
+            time_range = find_time_range(modified_date, candidate, overrides)
             if time_range:
                 assigned_range = time_range.label
             else:
-                # Use special folder for files outside time ranges
-                category = "时间范围有出入"
-                # Provide detailed reason for time range mismatch
-                if candidate.time_ranges:
-                    earliest_start = min(tr.start for tr in candidate.time_ranges)
-                    latest_end = max(tr.end for tr in candidate.time_ranges)
-                    if modified_date < earliest_start:
-                        reason = f"file modified {modified_date} is before earliest project start {earliest_start}"
-                    elif modified_date > latest_end:
-                        reason = f"file modified {modified_date} is after latest project end {latest_end}"
-                    else:
-                        # Date is within overall range but not in any specific range
-                        ranges_str = ", ".join(f"{tr.start}-{tr.end}" for tr in candidate.time_ranges)
-                        reason = f"file modified {modified_date} not in any defined ranges: {ranges_str}"
-                else:
-                    reason = "project has no defined time ranges"
-                # warnings.append(
-                #     f"{record['full_path']} falls outside defined time ranges for {canonical}: {reason}"
-                # )
+                warnings.append(
+                    f"{record['full_path']} falls outside derived time ranges for {canonical}"
+                )
         category = categorize_extension(record.get("file_ext", ""), categories)
 
         target_pattern = pattern.replace("<time-range>", assigned_range)
@@ -212,6 +238,12 @@ def main() -> None:
         help="Collected metadata to analyze.",
     )
     parser.add_argument(
+        "--folder-summary",
+        type=Path,
+        default=Path("output/folder_summary.json"),
+        help="Folder tree summary previously generated.",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("output"),
@@ -235,12 +267,6 @@ def main() -> None:
         default=Path(settings.SOURCE_FOLDER).parent
         / f"{Path(settings.SOURCE_FOLDER).name}-organized",
         help="Root directory that will house the tidied structure.",
-    )
-    parser.add_argument(
-        "--sample-size",
-        type=int,
-        default=200,
-        help="Number of metadata samples to feed to the LLM.",
     )
     parser.add_argument(
         "--manual-config",
@@ -276,15 +302,34 @@ def main() -> None:
     if not isinstance(metadata, list):
         raise SystemExit("Metadata file must contain a JSON array")
 
-    sample_size = max(1, min(len(metadata), args.sample_size))
-    sample = metadata[:sample_size]
+    if not args.folder_summary.exists():
+        raise SystemExit(f"Folder summary missing: {args.folder_summary}")
+    folder_summary = json.loads(args.folder_summary.read_text(encoding="utf-8"))
 
     if args.manual_config:
         config = load_json(args.manual_config)
     elif args.no_ai:
         raise SystemExit("Either provide --manual-config or allow AI lookup")
     else:
-        config = call_ai_for_config(sample, args.ai_temperature, args.ai_max_tokens)
+        config = call_ai_for_config(
+            folder_summary, args.ai_temperature, args.ai_max_tokens
+        )
+
+    projects = build_projects(config["projects"])
+    project_dates = derive_project_date_map(metadata, projects)
+    project_time_ranges = derive_project_time_ranges(project_dates)
+
+    for project_entry in config["projects"]:
+        canonical = project_entry["canonical_name"]
+        derived_ranges = project_time_ranges.get(canonical, [])
+        project_entry["time_ranges"] = [
+            {
+                "label": timerange.label,
+                "from": timerange.start.isoformat(),
+                "to": timerange.end.isoformat(),
+            }
+            for timerange in derived_ranges
+        ]
 
     config_output = args.config_output
     config_output.write_text(
@@ -292,14 +337,27 @@ def main() -> None:
     )
     logging.info("Plan configuration saved to %s", config_output)
 
-    entries, warnings = build_plan_entries(metadata, config, args.target_root)
+    entries, warnings = build_plan_entries(
+        metadata, config, args.target_root, project_time_ranges
+    )
     write_csv(entries, args.plan_path)
+    args.target_root.mkdir(parents=True, exist_ok=True)
+    plan_copy = args.target_root / args.plan_path.name
+    shutil.copy(args.plan_path, plan_copy)
+    if not plan_copy.exists():
+        raise SystemExit(f"Failed to copy move plan to target root at {plan_copy}")
+    logging.info("Plan copied to %s", plan_copy)
     summary = summarize(entries)
     summary.update(
         {
             "target_root": str(args.target_root),
             "generated_at": datetime.now(UTC).isoformat(),
             "metadata_count": len(metadata),
+            "folder_summary": str(args.folder_summary),
+            "derived_time_ranges": {
+                canonical: [tr.label for tr in ranges]
+                for canonical, ranges in project_time_ranges.items()
+            },
             "warnings": warnings,
         }
     )

@@ -93,11 +93,40 @@ def match_project(folder_chain: str, projects: Sequence[ProjectDefinition]) -> O
     return None
 
 
-def find_time_range(modified_date: date, project: ProjectDefinition) -> Optional[TimeRange]:
-    for candidate in project.time_ranges:
+def find_time_range(
+    modified_date: date,
+    project: ProjectDefinition,
+    override_ranges: Optional[Sequence[TimeRange]] = None,
+) -> Optional[TimeRange]:
+    ranges = override_ranges if override_ranges is not None else project.time_ranges
+    for candidate in ranges:
         if candidate.start <= modified_date <= candidate.end:
             return candidate
     return None
+
+
+def derive_time_ranges(
+    dates: Sequence[date], max_segments: int = 3
+) -> list[TimeRange]:
+    if not dates:
+        return []
+    sorted_dates = sorted(dates)
+    num_segments = min(max_segments, len(sorted_dates))
+    base_size = len(sorted_dates) // num_segments
+    remainder = len(sorted_dates) % num_segments
+    ranges: list[TimeRange] = []
+    index = 0
+    for segment in range(num_segments):
+        size = base_size + (1 if segment < remainder else 0)
+        chunk = sorted_dates[index : index + size]
+        index += size
+        start = chunk[0]
+        end = chunk[-1]
+        label = (
+            f"{start.year}-{end.year}" if start.year != end.year else f"{start.year}"
+        )
+        ranges.append(TimeRange(label, start, end))
+    return ranges
 
 
 def categorize_extension(extension: str, categories: Mapping[str, Set[str]]) -> str:
