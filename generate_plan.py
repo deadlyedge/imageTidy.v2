@@ -316,7 +316,12 @@ def main() -> None:
         help="Temperature for the LLM call.",
     )
     parser.add_argument(
-        "--ai-max-tokens", type=int, default=3000, help="Max tokens for the LLM call."
+        "--ai-max-tokens", type=int, default=8000, help="Max tokens for the LLM call."
+    )
+    parser.add_argument(
+        "--cover-missing",
+        action="store_true",
+        help="If some tags remain without canonical mapping, request a second pass for them.",
     )
     args = parser.parse_args()
 
@@ -365,6 +370,38 @@ def main() -> None:
             "categories": DEFAULT_CATEGORIES,
             "target_pattern": TARGET_PATTERN,
         }
+
+        if args.cover_missing:
+            submitted_tags = set(tag_input.get("tags", []))
+            mapped_tags: set[str] = set()
+            for project in config["projects"]:
+                canonical = project["canonical_name"]
+                mapped_tags.add(canonical)
+                mapped_tags.update(project.get("aliases", []))
+
+            missing = sorted(submitted_tags - mapped_tags)
+            if missing:
+                logging.info("Asking for coverage for %d missing tags", len(missing))
+                extra = call_ai_for_config(
+                    missing,
+                    overview,
+                    args.ai_temperature,
+                    args.ai_max_tokens,
+                )
+                additions = extra.get("projects", [])
+                if isinstance(additions, list):
+                    existing = {p["canonical_name"]: p for p in config["projects"]}
+                    for project in additions:
+                        canonical = project["canonical_name"]
+                        if canonical in existing:
+                            aliases = existing[canonical].setdefault("aliases", [])
+                            existing_set = set(aliases)
+                            for alias in project.get("aliases", []):
+                                if alias not in existing_set:
+                                    aliases.append(alias)
+                                    existing_set.add(alias)
+                        else:
+                            config["projects"].append(project)
 
     projects = build_projects(config["projects"])
     project_dates = derive_project_date_map(metadata, projects)

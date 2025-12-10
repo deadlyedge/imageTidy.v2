@@ -25,10 +25,11 @@ uv run python collect_metadata.py
    产出 `output/metadata.json`（每个文件的原始记录）、`output/folder_summary.json`（内部统计）、`output/tag_summary.json`（关键词标签及其原始链路/映射）、`output/tag_input.json`（供 AI 的 tag list，只有关键字）、以及 `output/folder_overview.json`（概览说明：总文件数、目录数量与 ascii tree，每个节点带文件数，帮 AI 判断目录权重）。
 
 2. **生成迁移计划**  
-    ```bash
-    export OPENAI_API_KEY=...
-    uv run python generate_plan.py
+   ```bash
+   export OPENAI_API_KEY=...
+   uv run python generate_plan.py
    ```  
+   如果想把当前 `tag_input.json` 中还没被 AI 覆盖的关键词下一轮再问一遍，可加 `--cover-missing`，脚本会以那些缺失 tag 作为第二轮输入。
    该脚本会把 `output/tag_input.json` 与 `output/folder_overview.json` 作为 AI 输入，让模型以关键词和权重为主导，再生成项目别名/别称映射（时间段由本地 metadata 计算）。完成后会生成：
    - `output/plan_config.json`（项目/时间/类别配置，包含本地计算出的时间区间）  
    - `output/move_plan.csv`（详细迁移计划，供你审核）  
@@ -53,3 +54,10 @@ uv run python collect_metadata.py
 - `output/`：所有中间文件与日志都在这里，默认被 `.gitignore` 忽略。
 
 在每一步务必先 review `output/` 下的 CSV/JSON，再进入下一个阶段，确保不会误删或错移老文件。
+
+
+# 写在最后
+
+整理遗留文件是一个复杂且风险较高的任务，务必多加小心。建议先在小范围内测试脚本和流程，确认无误后再大规模执行。祝你整理顺利！
+
+另外：还得是你啊，gemini！
