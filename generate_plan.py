@@ -83,7 +83,7 @@ def call_ai_for_config(
         model=settings.MODEL_NAME,
         messages=[{"role": "user", "content": payload}],
         temperature=temperature,
-        max_tokens=max_tokens,
+        # max_tokens=max_tokens,
     )
     content = response.choices[0].message.content
 
